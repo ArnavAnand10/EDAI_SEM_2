@@ -11,6 +11,16 @@ from skimage.restoration import estimate_sigma
 from skimage.filters import median
 from scipy.signal import convolve2d
 import uvicorn
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse
+from PIL import Image
+import numpy as np
+import uuid
+import time
+import io
+import json
+from typing import Optional
+from pydantic import BaseModel
 
 app = FastAPI(
     title="Image Forgery Detection API",
@@ -19,6 +29,120 @@ app = FastAPI(
 
 model_path = "casia2_model.h5"
 model = None
+
+
+class VerificationResult(BaseModel):
+    original_metadata: dict
+    is_intact: bool
+    message: str
+
+
+def embed_metadata_in_image(image_data: bytes) -> tuple[bytes, dict]:
+    metadata = {
+        "uuid": str(uuid.uuid4()),
+        "timestamp": int(time.time()),
+        "created_by": "steganography_api",
+    }
+
+    metadata_str = json.dumps(metadata)
+    metadata_binary = "".join(format(ord(char), "08b") for char in metadata_str)
+
+    img = Image.open(io.BytesIO(image_data))
+    img_array = np.array(img)
+
+    total_pixels = img_array.shape[0] * img_array.shape[1]
+    if len(metadata_binary) > total_pixels:
+        raise ValueError("Image is too small to embed metadata")
+
+    if len(img_array.shape) == 3:
+        flat_img = img_array.reshape(-1, img_array.shape[2])
+    else:
+        flat_img = img_array.flatten()
+
+    metadata_length = len(metadata_binary)
+    length_binary = format(metadata_length, "032b")
+
+    for i in range(32):
+        if i < len(length_binary):
+            if len(img_array.shape) == 3:
+                flat_img[i, 2] = (flat_img[i, 2] & ~1) | int(length_binary[i])
+            else:
+                flat_img[i] = (flat_img[i] & ~1) | int(length_binary[i])
+
+    for i in range(len(metadata_binary)):
+        pixel_position = i + 32
+        if pixel_position >= len(flat_img):
+            break
+
+        if len(img_array.shape) == 3:
+            flat_img[pixel_position, 2] = (flat_img[pixel_position, 2] & ~1) | int(
+                metadata_binary[i]
+            )
+        else:
+            flat_img[pixel_position] = (flat_img[pixel_position] & ~1) | int(
+                metadata_binary[i]
+            )
+
+    if len(img_array.shape) == 3:
+        new_img_array = flat_img.reshape(img_array.shape)
+    else:
+        new_img_array = flat_img.reshape(img_array.shape)
+
+    new_img = Image.fromarray(new_img_array)
+
+    img_byte_arr = io.BytesIO()
+    new_img.save(img_byte_arr, format=img.format or "PNG")
+    img_byte_arr.seek(0)
+
+    return img_byte_arr.getvalue(), metadata
+
+
+def extract_metadata_from_image(image_data: bytes) -> Optional[dict]:
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        img_array = np.array(img)
+
+        if len(img_array.shape) == 3:
+            flat_img = img_array.reshape(-1, img_array.shape[2])
+        else:
+            flat_img = img_array.flatten()
+
+        length_binary = ""
+        for i in range(32):
+            if i >= len(flat_img):
+                return None
+
+            if len(img_array.shape) == 3:
+                length_binary += str(flat_img[i, 2] & 1)
+            else:
+                length_binary += str(flat_img[i] & 1)
+
+        metadata_length = int(length_binary, 2)
+        if metadata_length <= 0 or metadata_length > len(flat_img):
+            return None
+
+        metadata_binary = ""
+        for i in range(metadata_length):
+            pixel_position = i + 32
+            if pixel_position >= len(flat_img):
+                break
+
+            if len(img_array.shape) == 3:
+                metadata_binary += str(flat_img[pixel_position, 2] & 1)
+            else:
+                metadata_binary += str(flat_img[pixel_position] & 1)
+
+        metadata_str = ""
+        for i in range(0, len(metadata_binary), 8):
+            if i + 8 <= len(metadata_binary):
+                byte = metadata_binary[i : i + 8]
+                metadata_str += chr(int(byte, 2))
+
+        metadata = json.loads(metadata_str)
+        return metadata
+    except Exception as e:
+        print(f"Error extracting metadata: {e}")
+        return None
 
 
 def load_model():
@@ -76,11 +200,6 @@ def preprocess_image(image):
     return colored
 
 
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the Image Forgery Detection API"}
-
-
 @app.post("/detect/")
 async def detect_forgery(file: UploadFile = File(...)):
     if not file:
@@ -129,29 +248,53 @@ async def detect_forgery(file: UploadFile = File(...)):
         )
 
 
-@app.get("/model-info/")
-def model_info():
-    if model is None:
-        return {"status": "Model not loaded", "info": None}
+@app.post("/embed")
+async def embed_image(image: UploadFile = File(...)):
+    if not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
 
     try:
-        return {
-            "status": "Model loaded",
-            "info": {
-                "input_shape": model.input_shape,
-                "output_shape": model.output_shape,
-                "trainable_params": int(
-                    np.sum([np.prod(v.get_shape()) for v in model.trainable_weights])
-                ),
-                "non_trainable_params": int(
-                    np.sum(
-                        [np.prod(v.get_shape()) for v in model.non_trainable_weights]
-                    )
-                ),
+        image_data = await image.read()
+
+        processed_image, metadata = embed_metadata_in_image(image_data)
+
+        return StreamingResponse(
+            io.BytesIO(processed_image),
+            media_type=image.content_type,
+            headers={
+                "Content-Disposition": f"attachment; filename=embedded_{image.filename}",
+                "X-Metadata-UUID": metadata["uuid"],
+                "X-Metadata-Timestamp": str(metadata["timestamp"]),
             },
-        }
+        )
     except Exception as e:
-        return {"status": "Error retrieving model info", "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
+
+
+@app.post("/verify", response_model=VerificationResult)
+async def verify_image(image: UploadFile = File(...)):
+    if not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    try:
+        image_data = await image.read()
+
+        metadata = extract_metadata_from_image(image_data)
+
+        if metadata:
+            return VerificationResult(
+                original_metadata=metadata,
+                is_intact=True,
+                message="Image metadata extracted successfully, image appears intact.",
+            )
+        else:
+            return VerificationResult(
+                original_metadata={},
+                is_intact=False,
+                message="Failed to extract metadata. The image may have been tampered with or does not contain embedded metadata.",
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error verifying image: {str(e)}")
 
 
 if __name__ == "__main__":
